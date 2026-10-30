@@ -22,13 +22,17 @@ import java.net.MalformedURLException;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLDecoder;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 import org.jdom2.CDATA;
 import org.jdom2.Document;
@@ -75,6 +79,11 @@ public class RssService {
   private static final String ITUNES_CATEGORY_TEXT = "Technology";
   private static final String ITUNES_EXPLICIT_TEXT = "false";
 
+  // Podcasting 2.0 namespace UUID used to derive <podcast:guid> via UUIDv5, per
+  // https://github.com/Podcastindex-org/podcast-namespace/blob/main/docs/tags/guid.md
+  private static final UUID PODCAST_GUID_NAMESPACE =
+      UUID.fromString("ead4c236-bf58-58c6-a2c6-a6b28d128cb6");
+
   public RssService(ChannelService channelService, EpisodeService episodeService,
       PlaylistService playlistService, MediaService mediaService, MessageSource messageSource,
       AppBaseUrlResolver appBaseUrlResolver, FeedDefaultsService feedDefaultsService,
@@ -108,7 +117,8 @@ public class RssService {
         channel.getDescription(),
         language);
     feed.setEntries(buildEntries(episodes, appBaseUrl, channel.getSource(), false));
-    return writeFeed(feed, coverUrl);
+    String feedSelfUrl = normalizeUrlProtocol(appBaseUrl) + "/api/rss/" + channel.getId() + ".xml";
+    return writeFeed(feed, coverUrl, feedSelfUrl);
   }
 
   public static final int DEFAULT_UNIFIED_RSS_LIMIT = 300;
@@ -148,7 +158,8 @@ public class RssService {
 
     SyndFeed feed = createFeed(feedTitle, appBaseUrl, "PigeonPod Unified Feed - All Episodes", language);
     feed.setEntries(buildEntries(episodes, appBaseUrl, null, false));
-    return writeFeed(feed, coverUrl);
+    String feedSelfUrl = normalizeUrlProtocol(appBaseUrl) + "/api/rss/all.xml";
+    return writeFeed(feed, coverUrl, feedSelfUrl);
   }
 
   public String generatePlaylistRssFeed(String playlistId) throws MalformedURLException {
@@ -174,7 +185,8 @@ public class RssService {
         language);
     boolean withPlaylistSourcePrefix = "YOUTUBE".equalsIgnoreCase(playlist.getSource());
     feed.setEntries(buildEntries(episodes, appBaseUrl, playlist.getSource(), withPlaylistSourcePrefix));
-    return writeFeed(feed, coverUrl);
+    String feedSelfUrl = normalizeUrlProtocol(appBaseUrl) + "/api/rss/playlist/" + playlist.getId() + ".xml";
+    return writeFeed(feed, coverUrl, feedSelfUrl);
   }
 
   private String resolveEpisodeSource(Episode episode) {
@@ -481,7 +493,7 @@ public class RssService {
 
       Element chaptersElement = new Element("chapters", PODCAST_NS);
       chaptersElement.setAttribute("url", chapterUrl);
-      chaptersElement.setAttribute("type", "application/json");
+      chaptersElement.setAttribute("type", "application/json+chapters");
       foreignMarkup.add(chaptersElement);
       log.debug("[rss] chapters tag added: episodeId={}", episode.getId());
     } catch (Exception e) {
@@ -490,7 +502,7 @@ public class RssService {
     }
   }
 
-  private String writeFeed(SyndFeed feed, String coverUrl) {
+  private String writeFeed(SyndFeed feed, String coverUrl, String feedSelfUrl) {
     try (StringWriter writer = new StringWriter()) {
       SyndFeedOutput output = new SyndFeedOutput();
 
@@ -506,6 +518,7 @@ public class RssService {
 
       // 4. 使用 JDOM 的输出工具将修改后的 Document 写出
       applyGlobalItunesTags(document, coverUrl);
+      applyPodcastGuid(document, feedSelfUrl);
       wrapItemDescriptionWithCdata(document);
       XMLOutputter xmlOutputter = new XMLOutputter(Format.getPrettyFormat());
       xmlOutputter.output(document, writer);
@@ -575,6 +588,77 @@ public class RssService {
     upsertItunesExplicit(channel);
     normalizeItunesCategory(channel);
     upsertItunesImage(channel, coverUrl);
+  }
+
+  /**
+   * Inserts the channel-level {@code <podcast:guid>} element, as described at
+   * https://github.com/Podcastindex-org/podcast-namespace/blob/main/docs/tags/guid.md
+   *
+   * <p>The value is a UUIDv5 derived from the feed's own canonical URL, with the protocol
+   * scheme and trailing slashes stripped, seeded with the namespace UUID
+   * {@code ead4c236-bf58-58c6-a2c6-a6b28d128cb6} reserved by the spec for this purpose.
+   */
+  private void applyPodcastGuid(Document document, String feedSelfUrl) {
+    if (!StringUtils.hasText(feedSelfUrl)) {
+      return;
+    }
+    Element root = document.getRootElement();
+    Element channel = root.getChild("channel");
+    if (channel == null) {
+      return;
+    }
+
+    channel.removeChildren("guid", PODCAST_NS);
+    String guidSeed = stripProtocolAndTrailingSlashes(feedSelfUrl);
+    UUID guid = generateUuidV5(PODCAST_GUID_NAMESPACE, guidSeed);
+    Element guidElement = new Element("guid", PODCAST_NS);
+    guidElement.setText(guid.toString());
+    insertBeforeFirstItem(channel, guidElement);
+  }
+
+  private String stripProtocolAndTrailingSlashes(String url) {
+    String stripped = url.trim();
+    if (stripped.startsWith("https://")) {
+      stripped = stripped.substring("https://".length());
+    } else if (stripped.startsWith("http://")) {
+      stripped = stripped.substring("http://".length());
+    }
+    while (stripped.endsWith("/")) {
+      stripped = stripped.substring(0, stripped.length() - 1);
+    }
+    return stripped;
+  }
+
+  /**
+   * Generates a UUIDv5 (name-based, SHA-1) value. Java's {@link UUID} only ships a v3 (MD5)
+   * generator, so the v5 algorithm is implemented by hand here per RFC 4122.
+   */
+  private UUID generateUuidV5(UUID namespace, String name) {
+    try {
+      MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+      ByteBuffer namespaceBytes = ByteBuffer.allocate(16);
+      namespaceBytes.putLong(namespace.getMostSignificantBits());
+      namespaceBytes.putLong(namespace.getLeastSignificantBits());
+      sha1.update(namespaceBytes.array());
+      byte[] hash = sha1.digest(name.getBytes(StandardCharsets.UTF_8));
+
+      hash[6] &= 0x0f;
+      hash[6] |= 0x50; // version 5
+      hash[8] &= 0x3f;
+      hash[8] |= (byte) 0x80; // RFC 4122 variant
+
+      long mostSigBits = 0;
+      for (int i = 0; i < 8; i++) {
+        mostSigBits = (mostSigBits << 8) | (hash[i] & 0xffL);
+      }
+      long leastSigBits = 0;
+      for (int i = 8; i < 16; i++) {
+        leastSigBits = (leastSigBits << 8) | (hash[i] & 0xffL);
+      }
+      return new UUID(mostSigBits, leastSigBits);
+    } catch (NoSuchAlgorithmException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   private void removeItunesOwner(Element channel) {
