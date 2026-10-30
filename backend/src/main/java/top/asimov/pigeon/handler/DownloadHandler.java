@@ -1192,7 +1192,7 @@ public class DownloadHandler {
 
         startSeconds = Math.max(0D, startSeconds);
         ObjectNode chapter = objectMapper.createObjectNode();
-        chapter.put("start-time", normalizeChapterSeconds(startSeconds));
+        chapter.put("startTime", normalizeChapterSeconds(startSeconds));
 
         String title = chapterNode.path("title").asText();
         chapter.put("title", StringUtils.hasText(title) ? title : "Chapter " + chapterIndex);
@@ -1200,7 +1200,7 @@ public class DownloadHandler {
         Double endSeconds = readSeconds(chapterNode.get("end_time"));
         if (endSeconds != null) {
           if (endSeconds > startSeconds) {
-            chapter.put("end-time", normalizeChapterSeconds(endSeconds));
+            chapter.put("endTime", normalizeChapterSeconds(endSeconds));
           }
         }
 
